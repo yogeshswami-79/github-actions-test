@@ -8,6 +8,7 @@ on:
 
 jobs:
   build-and-test:
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
     runs-on: ubuntu-latest
 
     steps:
@@ -28,3 +29,49 @@ jobs:
 
       - name: Test
         run: npm test
+
+  security-audit-actions:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for workflow file changes
+        id: changed
+        run: |
+          if git diff --name-only "${{ github.event.pull_request.base.sha }}" "${{ github.sha }}" -- .github/workflows | grep -q .; then
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Audit workflow files for vulnerabilities
+        if: steps.changed.outputs.has_changes == 'true'
+        uses: anthropics/claude-code-action@v1
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+
+            Use the Task tool to launch the `backend-security-auditor` subagent (defined in .claude/agents/backend-security-auditor.md) to audit every file under `.github/workflows/` in this repo for GitHub Actions-specific vulnerabilities, in particular:
+            - Untrusted input (issue/PR titles, bodies, comments, branch/fork names, commit messages) interpolated directly into `run:` steps via GitHub Actions expression syntax (double curly braces) instead of passed through `env:`.
+            - `pull_request_target` or `workflow_run` combined with checking out and running untrusted PR head code ("pwn request" pattern).
+            - Secrets passed to jobs/steps reachable from untrusted forked-PR triggers, or secrets echoed/logged.
+            - Third-party actions pinned to a mutable tag/branch instead of a full commit SHA.
+            - Overly broad `permissions:` (e.g. default read-write, or write scopes not needed by the job).
+            - Missing `persist-credentials: false` on checkout where long-lived credentials aren't needed.
+
+            Report only concrete issues actually found in this repo's workflow files — no generic advice. Then post the findings as a single PR comment via `gh pr comment ${{ github.event.pull_request.number }} --body "..."`. If nothing is found, post a short comment saying so.
+          claude_args: |
+            --allowedTools "Task,Read,Grep,Glob,Bash(gh pr comment:*),Bash(git diff:*),Bash(git log:*)"
